@@ -22,7 +22,7 @@ from PySide6.QtGui import QPainter, QColor, QFont, QPen, QPixmap
 
 signal.signal(signal.SIGINT, signal.SIG_DFL)
 
-VERSION = "v0.0.0"
+VERSION = "v1.0.1"
 
 # XInput / Controller Support
 
