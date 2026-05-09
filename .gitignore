@@ -3,3 +3,4 @@ build/
 config.json
 NSI_BUILDER/InGameRank_Installer.exe
 .venv/
+NSI_BUILDER/InGameRank.exe

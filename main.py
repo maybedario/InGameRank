@@ -11,20 +11,23 @@ import urllib.parse
 import signal
 import ctypes
 import argparse
+import webbrowser
+import re
 from ctypes import wintypes
 
-from PySide6.QtWidgets import QApplication, QWidget, QLabel, QVBoxLayout, QDialog
+from PySide6.QtWidgets import QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout, QPushButton, QDialog
 from PySide6.QtCore import Qt, QTimer, QThread, Signal
 from PySide6.QtGui import QPainter, QColor, QFont, QPen, QPixmap
 
 
 signal.signal(signal.SIGINT, signal.SIG_DFL)
 
+VERSION = "v0.0.0"
 
 # XInput / Controller Support
 
 class XINPUT_GAMEPAD(ctypes.Structure):
-    _fields_ = [
+    _fields_ =[
         ("wButtons", wintypes.WORD),
         ("bLeftTrigger", wintypes.BYTE),
         ("bRightTrigger", wintypes.BYTE),
@@ -35,7 +38,7 @@ class XINPUT_GAMEPAD(ctypes.Structure):
     ]
 
 class XINPUT_STATE(ctypes.Structure):
-    _fields_ = [
+    _fields_ =[
         ("dwPacketNumber", wintypes.DWORD),
         ("Gamepad", XINPUT_GAMEPAD),
     ]
@@ -56,6 +59,43 @@ def get_xinput_state(user_index=0):
     return None
 
 
+# DirectInput / WinMM controller support
+
+try:
+    winmm = ctypes.windll.winmm
+except OSError:
+    winmm = None
+
+JOY_RETURNBUTTONS   = 0x00000080
+WINMM_MAX_JOYSTICKS = 16
+
+class JOYINFOEX(ctypes.Structure):
+    _fields_ =[
+        ("dwSize",         wintypes.DWORD),
+        ("dwFlags",        wintypes.DWORD),
+        ("dwXpos",         wintypes.DWORD),
+        ("dwYpos",         wintypes.DWORD),
+        ("dwZpos",         wintypes.DWORD),
+        ("dwRpos",         wintypes.DWORD),
+        ("dwUpos",         wintypes.DWORD),
+        ("dwVpos",         wintypes.DWORD),
+        ("dwButtons",      wintypes.DWORD),
+        ("dwButtonNumber", wintypes.DWORD),
+        ("dwPOV",          wintypes.DWORD),
+        ("dwReserved1",    wintypes.DWORD),
+        ("dwReserved2",    wintypes.DWORD),
+    ]
+
+def get_directinput_buttons(joy_id: int):
+    if not winmm: return None
+    info         = JOYINFOEX()
+    info.dwSize  = ctypes.sizeof(JOYINFOEX)
+    info.dwFlags = JOY_RETURNBUTTONS
+    if winmm.joyGetPosEx(joy_id, ctypes.byref(info)) == 0:
+        return info.dwButtons
+    return None
+
+
 def resource_path(relative_path):
     """ Get absolute path to resource, works for dev and for PyInstaller """
     try:
@@ -71,7 +111,9 @@ CONFIG_FILE = "config.json"
 config = {
     "hotkey": "tab",
     "is_controller": False,
+    "controller_type": "xinput",  # "xinput" | "directinput"
     "controller_button": 0,
+    "joy_id": 0,
     "rl_window_title": "Rocket League",
     "rl_host": "127.0.0.1",
     "rl_port": 49123,
@@ -79,7 +121,7 @@ config = {
 }
 
 class BindWorker(QThread):
-    finished_bind = Signal(str, bool, int)
+    finished_bind = Signal(str, bool, int, int, str)
 
     def run(self):
         time.sleep(0.5) # Prevent registering accidental presses
@@ -90,23 +132,46 @@ class BindWorker(QThread):
             pressed_key = e.name
             
         keyboard.on_press(on_press)
+
+        # snapshot to avoid triggering on already-held buttons
+        initial_joy_buttons = {}
+        for joy_id in range(WINMM_MAX_JOYSTICKS):
+            btns = get_directinput_buttons(joy_id)
+            if btns is not None:
+                initial_joy_buttons[joy_id] = btns
         
         while True:
-            # Check keyboard
             if pressed_key:
-                self.finished_bind.emit(pressed_key, False, 0)
+                self.finished_bind.emit(pressed_key, False, 0, 0, "keyboard")
                 break
-                
-            # Check controller
-            state = get_xinput_state()
-            if state and state.Gamepad.wButtons != 0:
-                btn = state.Gamepad.wButtons
-                # Wait until button is released so it doesn't trigger immediately
+
+            # check XInput
+            xi = get_xinput_state()
+            if xi and xi.Gamepad.wButtons != 0:
+                btn = xi.Gamepad.wButtons
                 while get_xinput_state() and get_xinput_state().Gamepad.wButtons != 0:
                     time.sleep(0.05)
-                self.finished_bind.emit("", True, btn)
+                self.finished_bind.emit("", True, btn, 0, "xinput")
                 break
-                
+
+            # check DirectInput 
+            found_di = False
+            for joy_id, prev in list(initial_joy_buttons.items()):
+                btns = get_directinput_buttons(joy_id)
+                if btns is None: continue
+                newly = btns & ~prev
+                if newly:
+                    while True:
+                        cur = get_directinput_buttons(joy_id)
+                        if cur is None or (cur & newly) == 0: break
+                        time.sleep(0.05)
+                    self.finished_bind.emit("", True, newly, joy_id, "directinput")
+                    found_di = True
+                    break
+                initial_joy_buttons[joy_id] = btns
+
+            if found_di: break
+
             time.sleep(0.01)
             
         keyboard.unhook_all()
@@ -119,7 +184,7 @@ class SetupDialog(QDialog):
         self.setWindowFlags(Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
         
         layout = QVBoxLayout()
-        label = QLabel("Press any <b>KEYBOARD KEY</b> or <b>XBOX CONTROLLER BUTTON</b><br>to bind the overlay hotkey...")
+        label = QLabel("Press any <b>KEYBOARD KEY</b> or <b>CONTROLLER BUTTON</b><br>to bind the overlay hotkey...")
         label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         label.setStyleSheet("font-size: 14px; font-family: Segoe UI;")
         layout.addWidget(label)
@@ -129,12 +194,17 @@ class SetupDialog(QDialog):
         self.worker.finished_bind.connect(self.on_bind_finished)
         self.worker.start()
 
-    def on_bind_finished(self, key, is_controller, btn):
+    def on_bind_finished(self, key, is_controller, btn, joy_id, controller_type):
         global config
         if is_controller:
-            config["is_controller"] = True
+            config["is_controller"]     = True
+            config["controller_type"]   = controller_type
             config["controller_button"] = btn
-            print(f"[Overlay] Bound to controller button: {btn}")
+            config["joy_id"]            = joy_id
+            if controller_type == "directinput":
+                print(f"[Overlay] Bound to DirectInput controller (joy_id={joy_id}), button mask: {btn}")
+            else:
+                print(f"[Overlay] Bound to controller button: {btn}")
         else:
             config["is_controller"] = False
             config["hotkey"] = key
@@ -152,6 +222,8 @@ def load_or_setup_config(force_rebind=False):
         try:
             with open(CONFIG_FILE, "r") as f:
                 config.update(json.load(f))
+            config.setdefault("controller_type", "xinput")  # backward compat
+            config.setdefault("joy_id", 0)
         except Exception as e:
             print(f"[Overlay] Failed to load config: {e}")
             needs_setup = True
@@ -161,6 +233,61 @@ def load_or_setup_config(force_rebind=False):
     if needs_setup:
         dialog = SetupDialog()
         dialog.exec()
+
+class UpdateDialog(QDialog):
+    def __init__(self, latest_version, url):
+        super().__init__()
+        self.setWindowTitle("Update Available")
+        self.setFixedSize(400, 150)
+        self.setWindowFlags(Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
+        
+        self.url = url
+        
+        layout = QVBoxLayout()
+        label = QLabel(f"A new update is available version {latest_version}")
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        label.setStyleSheet("font-size: 14px; font-family: Segoe UI;")
+        layout.addWidget(label)
+        
+        btn_layout = QHBoxLayout()
+        btn_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        btn_update = QPushButton("Update")
+        btn_update.setFixedSize(100, 30)
+        btn_update.clicked.connect(self.on_update)
+        
+        btn_ignore = QPushButton("Ignore")
+        btn_ignore.setFixedSize(100, 30)
+        btn_ignore.clicked.connect(self.reject)
+        
+        btn_layout.addWidget(btn_update)
+        btn_layout.addWidget(btn_ignore)
+        
+        layout.addLayout(btn_layout)
+        self.setLayout(layout)
+
+    def on_update(self):
+        webbrowser.open(self.url)
+        self.accept()
+
+def check_for_updates():
+    try:
+        url = "https://github.com/nixvio64/InGameRank/releases/latest"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+        with urllib.request.urlopen(req, timeout=5) as response:
+            final_url = response.geturl()
+            
+        if "/releases/tag/" in final_url:
+            latest_version = final_url.split("/releases/tag/")[-1]
+            
+            def parse_v(v):
+                return tuple(int(i) for i in re.findall(r'\d+', v))
+                
+            if parse_v(latest_version) > parse_v(VERSION):
+                dialog = UpdateDialog(latest_version, final_url)
+                dialog.exec()
+    except Exception as e:
+        print(f"[Update Check] Failed to check for updates: {e}")
 
 FONT_NAME = "Segoe UI"
 FONT_SIZE = 11
@@ -438,11 +565,17 @@ def is_rl_focused() -> bool:
 def is_hotkey_pressed() -> bool:
     try:
         if config.get("is_controller", False):
-            state = get_xinput_state()
-            if state:
-                btn = config.get("controller_button", 0)
-                return (state.Gamepad.wButtons & btn) == btn
-            return False
+            ctrl_type = config.get("controller_type", "xinput")  # default for old configs
+            if ctrl_type == "directinput":
+                btns = get_directinput_buttons(config.get("joy_id", 0))
+                mask = config.get("controller_button", 0)
+                return btns is not None and (btns & mask) == mask
+            else:
+                state = get_xinput_state()
+                if state:
+                    btn = config.get("controller_button", 0)
+                    return (state.Gamepad.wButtons & btn) == btn
+                return False
         else:
             return keyboard.is_pressed(config["hotkey"])
     except Exception:
@@ -667,9 +800,6 @@ class Overlay(QWidget):
             self.update()
 
 
-
-
-
     def division_stack_height(self, tier_id: int) -> int:
         if tier_id >= 22 or tier_id <= 0: return 0
         color_id = get_div_color_id(tier_id)
@@ -701,7 +831,6 @@ class Overlay(QWidget):
             max_w = max(max_w, pm.width())
 
         return max_w + self.metrics["division_next_pad"]
-
 
 
     def paintEvent(self, event):
@@ -892,10 +1021,19 @@ if __name__ == "__main__":
     
     # Needs to be called after QApplication so QDialog can be used
     load_or_setup_config(force_rebind=args.rebind)
+    check_for_updates()
     
     threading.Thread(target=read_stream, daemon=True).start()
-    
-    bind_msg = f"[{config['hotkey'].upper()}]" if not config.get("is_controller") else f"[Controller Button {config.get('controller_button')}]"
+
+    if config.get("is_controller"):
+        ctrl_type = config.get("controller_type", "xinput")
+        if ctrl_type == "directinput":
+            bind_msg = f"[DirectInput Controller joy_id={config.get('joy_id', 0)}, mask={config.get('controller_button')}]"
+        else:
+            bind_msg = f"[Controller Button {config.get('controller_button')}]"
+    else:
+        bind_msg = f"[{config['hotkey'].upper()}]"
+
     print(f"[Overlay] Launch Rocket League and hold {bind_msg} to view stats.", flush=True)
 
     overlay = Overlay()
