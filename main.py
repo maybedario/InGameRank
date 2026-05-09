@@ -14,6 +14,7 @@ import argparse
 import webbrowser
 import re
 from ctypes import wintypes
+from dualsense_controller import DualSenseController
 
 from PySide6.QtWidgets import QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout, QPushButton, QDialog
 from PySide6.QtCore import Qt, QTimer, QThread, Signal
@@ -58,43 +59,71 @@ def get_xinput_state(user_index=0):
         return state
     return None
 
+# DualSense Controller Support
 
-# DirectInput / WinMM controller support
+ps_controller: None | DualSenseController = None
+_ps_pressed = set()
+_ps_btns = ["btn_cross", "btn_circle", "btn_square", "btn_triangle",
+            "btn_l1", "btn_r1", "btn_l2", "btn_r2",
+            "btn_l3", "btn_r3", "btn_options", "btn_create",
+            "btn_ps", "btn_touchpad", "btn_mute",
+            "btn_up", "btn_down", "btn_left", "btn_right"]
 
-try:
-    winmm = ctypes.windll.winmm
-except OSError:
-    winmm = None
+def _ps_make_handler(name):
+    def handler(value):
+        global _ps_pressed
+        if value:
+            _ps_pressed.add(name)
+        else:
+            _ps_pressed.discard(name)
+    return handler
 
-JOY_RETURNBUTTONS   = 0x00000080
-WINMM_MAX_JOYSTICKS = 16
+def _ps_disconnect_handler(controller):
+    def _reconnect_loop():
+        try:
+            controller.deactivate()
+        except Exception:
+            pass
 
-class JOYINFOEX(ctypes.Structure):
-    _fields_ =[
-        ("dwSize",         wintypes.DWORD),
-        ("dwFlags",        wintypes.DWORD),
-        ("dwXpos",         wintypes.DWORD),
-        ("dwYpos",         wintypes.DWORD),
-        ("dwZpos",         wintypes.DWORD),
-        ("dwRpos",         wintypes.DWORD),
-        ("dwUpos",         wintypes.DWORD),
-        ("dwVpos",         wintypes.DWORD),
-        ("dwButtons",      wintypes.DWORD),
-        ("dwButtonNumber", wintypes.DWORD),
-        ("dwPOV",          wintypes.DWORD),
-        ("dwReserved1",    wintypes.DWORD),
-        ("dwReserved2",    wintypes.DWORD),
-    ]
+        print("[Controller] Disconnected. Waiting for reconnect...")
+        while True:
+            time.sleep(2)
+            try:
+                controller.activate()
+                print("[Controller] Reconnected!")
+                return
+            except Exception:
+                pass # not available yet, keep waiting
 
-def get_directinput_buttons(joy_id: int):
-    if not winmm: return None
-    info         = JOYINFOEX()
-    info.dwSize  = ctypes.sizeof(JOYINFOEX)
-    info.dwFlags = JOY_RETURNBUTTONS
-    if winmm.joyGetPosEx(joy_id, ctypes.byref(info)) == 0:
-        return info.dwButtons
-    return None
+    threading.Thread(target=_reconnect_loop, daemon=True).start()
 
+def is_ps_connected() -> bool:
+    device_infos = DualSenseController.enumerate_devices()
+    if len(device_infos) < 1:
+        return False
+    return True
+
+def setup_ps_controller() -> None | DualSenseController:
+    if not is_ps_connected():
+        return None # no dualsense available
+
+    controller = DualSenseController()
+    controller.activate()
+
+    # bind buttons
+    for btn_name in _ps_btns:
+        getattr(controller, btn_name).on_change(_ps_make_handler(btn_name))
+
+    controller.on_error(lambda: _ps_disconnect_handler(controller))
+
+    global ps_controller
+    ps_controller = controller
+
+    return controller
+
+def ps_get_inputs():
+    """Returns list of currently held buttons"""
+    return list(_ps_pressed)
 
 def resource_path(relative_path):
     """ Get absolute path to resource, works for dev and for PyInstaller """
@@ -111,7 +140,7 @@ CONFIG_FILE = "config.json"
 config = {
     "hotkey": "tab",
     "is_controller": False,
-    "controller_type": "xinput",  # "xinput" | "directinput"
+    "controller_type": "xinput",  # "xinput" | "dualsense"
     "controller_button": 0,
     "joy_id": 0,
     "rl_window_title": "Rocket League",
@@ -133,13 +162,8 @@ class BindWorker(QThread):
             
         keyboard.on_press(on_press)
 
-        # snapshot to avoid triggering on already-held buttons
-        initial_joy_buttons = {}
-        for joy_id in range(WINMM_MAX_JOYSTICKS):
-            btns = get_directinput_buttons(joy_id)
-            if btns is not None:
-                initial_joy_buttons[joy_id] = btns
-        
+        setup_ps_controller()
+
         while True:
             if pressed_key:
                 self.finished_bind.emit(pressed_key, False, 0, 0, "keyboard")
@@ -154,23 +178,16 @@ class BindWorker(QThread):
                 self.finished_bind.emit("", True, btn, 0, "xinput")
                 break
 
-            # check DirectInput 
-            found_di = False
-            for joy_id, prev in list(initial_joy_buttons.items()):
-                btns = get_directinput_buttons(joy_id)
-                if btns is None: continue
-                newly = btns & ~prev
-                if newly:
-                    while True:
-                        cur = get_directinput_buttons(joy_id)
-                        if cur is None or (cur & newly) == 0: break
-                        time.sleep(0.05)
-                    self.finished_bind.emit("", True, newly, joy_id, "directinput")
-                    found_di = True
-                    break
-                initial_joy_buttons[joy_id] = btns
+            # check DualSense
+            found_ds = False
+            if ps_controller:
+                ps_input_result = ps_get_inputs()
+                if ps_input_result:
+                    ps_btn = ps_input_result[0]
+                    self.finished_bind.emit("", True, _ps_btns.index(ps_btn), 0, "dualsense")
+                    found_ds = True
 
-            if found_di: break
+            if found_ds: break
 
             time.sleep(0.01)
             
@@ -201,8 +218,9 @@ class SetupDialog(QDialog):
             config["controller_type"]   = controller_type
             config["controller_button"] = btn
             config["joy_id"]            = joy_id
-            if controller_type == "directinput":
-                print(f"[Overlay] Bound to DirectInput controller (joy_id={joy_id}), button mask: {btn}")
+            if controller_type == "dualsense":
+                btn_name = _ps_btns[btn]
+                print(f"[Overlay] Bound to DualSense controller button: {btn_name}")
             else:
                 print(f"[Overlay] Bound to controller button: {btn}")
         else:
@@ -566,10 +584,14 @@ def is_hotkey_pressed() -> bool:
     try:
         if config.get("is_controller", False):
             ctrl_type = config.get("controller_type", "xinput")  # default for old configs
-            if ctrl_type == "directinput":
-                btns = get_directinput_buttons(config.get("joy_id", 0))
-                mask = config.get("controller_button", 0)
-                return btns is not None and (btns & mask) == mask
+            if ctrl_type == "dualsense":
+                if not is_ps_connected():
+                    return False
+                
+                btns = ps_get_inputs()
+                mask_id = config.get("controller_button", 0)
+                mask = _ps_btns[mask_id]
+                return mask in btns
             else:
                 state = get_xinput_state()
                 if state:
@@ -1027,8 +1049,8 @@ if __name__ == "__main__":
 
     if config.get("is_controller"):
         ctrl_type = config.get("controller_type", "xinput")
-        if ctrl_type == "directinput":
-            bind_msg = f"[DirectInput Controller joy_id={config.get('joy_id', 0)}, mask={config.get('controller_button')}]"
+        if ctrl_type == "dualsense":
+            bind_msg = f"[DualSense Controller Button {_ps_btns[config.get('controller_button')]}]"
         else:
             bind_msg = f"[Controller Button {config.get('controller_button')}]"
     else:
