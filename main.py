@@ -1,5 +1,14 @@
 import sys
 import os
+import warnings
+warnings.filterwarnings("ignore", message="Microphone state initially", category=UserWarning)
+import logging
+# suppress dualsense OSError 
+_ds_logger = logging.getLogger("dualsense_controller")
+_ds_logger.setLevel(logging.CRITICAL)
+_ds_logger.addHandler(logging.NullHandler())
+_ds_logger.propagate = False  
+
 import threading
 import time
 import json
@@ -13,8 +22,6 @@ import ctypes
 import argparse
 import webbrowser
 import re
-import warnings
-import logging
 import atexit
 from ctypes import wintypes
 from dualsense_controller import DualSenseController
@@ -24,12 +31,7 @@ from PySide6.QtCore import Qt, QTimer, QThread, Signal
 from PySide6.QtGui import QPainter, QColor, QFont, QPen, QPixmap
 
 
-signal.signal(signal.SIGINT, signal.SIG_DFL)
-
-warnings.filterwarnings("ignore", message="Microphone state initially", category=UserWarning)
-logging.getLogger("dualsense_controller").setLevel(logging.CRITICAL)
-
-VERSION = "v1.0.2"
+VERSION = "v1.0.3"
 DEBUG = False
 
 # XInput / Controller Support
@@ -87,20 +89,18 @@ def _ps_make_handler(name):
 
 def _ps_disconnect_handler(controller):
     def _reconnect_loop():
+        global ps_controller, _ps_pressed
+
+        _ps_pressed = set()
+
         try:
             controller.deactivate()
         except Exception:
             pass
 
+
+        ps_controller = None
         print("[Controller] Disconnected. Waiting for reconnect...")
-        while True:
-            time.sleep(2)
-            try:
-                controller.activate()
-                print("[Controller] Reconnected!")
-                return
-            except Exception:
-                pass # not available yet, keep waiting
 
     threading.Thread(target=_reconnect_loop, daemon=True).start()
 
@@ -116,7 +116,9 @@ def setup_ps_controller() -> None | DualSenseController:
         return None # no dualsense available
 
     controller = DualSenseController()
-    controller.activate()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        controller.activate()
 
     # bind buttons
     for btn_name in _ps_btns:
@@ -129,18 +131,39 @@ def setup_ps_controller() -> None | DualSenseController:
 
     return controller
 
+def _ps_monitor_thread():
+    global ps_controller
+    while True:
+        time.sleep(3)
+        if (config.get("is_controller") and config.get("controller_type") == "dualsense" and ps_controller is None):
+            result = setup_ps_controller()
+            if result:
+                print("[Controller] Reconnected!")
+                if DEBUG: print("[DEBUG] DualSense connected by monitor thread")
+
 def ps_get_inputs():
     """Returns list of currently held buttons"""
     return list(_ps_pressed)
 
 def _cleanup():
+    global ps_controller
     if ps_controller:
         try:
-            ps_controller.deactivate()
+            t = threading.Thread(target=ps_controller.deactivate, daemon=True)
+            t.start()
+            t.join(timeout=2.0)
         except Exception:
             pass
+        ps_controller = None
 
 atexit.register(_cleanup)
+
+def _sigint_handler(sig, frame):
+    """Handle CTRL+C: clean up the controller, then hard-exit so nothing can hang."""
+    _cleanup()
+    os._exit(0)  
+
+signal.signal(signal.SIGINT, _sigint_handler)
 
 def resource_path(relative_path):
     """ Get absolute path to resource, works for dev and for PyInstaller """
@@ -270,6 +293,10 @@ def load_or_setup_config(force_rebind=False):
     if needs_setup:
         dialog = SetupDialog()
         dialog.exec()
+
+    # start monitor thread 
+    if config.get("is_controller") and config.get("controller_type") == "dualsense":
+        threading.Thread(target=_ps_monitor_thread, daemon=True).start()
 
 class UpdateDialog(QDialog):
     def __init__(self, latest_version, url):
@@ -608,18 +635,19 @@ def is_hotkey_pressed() -> bool:
         if config.get("is_controller", False):
             ctrl_type = config.get("controller_type", "xinput")  # default for old configs
             if ctrl_type == "dualsense":
-                if not is_ps_connected():
+                # check ps_controller directly 
+                if ps_controller is None:
                     return False
-                
+
                 btns = ps_get_inputs()
                 mask_id = config.get("controller_button", 0)
                 mask = _ps_btns[mask_id]
                 return mask in btns
             else:
-                state = get_xinput_state()
-                if state:
+                xi_state = get_xinput_state()
+                if xi_state:
                     btn = config.get("controller_button", 0)
-                    return (state.Gamepad.wButtons & btn) == btn
+                    return (xi_state.Gamepad.wButtons & btn) == btn
                 return False
         else:
             return keyboard.is_pressed(config["hotkey"])
