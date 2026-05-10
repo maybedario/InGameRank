@@ -29,11 +29,17 @@ from dualsense_controller import DualSenseController
 from PySide6.QtWidgets import QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout, QPushButton, QDialog
 from PySide6.QtCore import Qt, QTimer, QThread, Signal
 from PySide6.QtGui import QPainter, QColor, QFont, QPen, QPixmap
+from curl_cffi import requests as cf_requests
+import random
 
-
-VERSION = "v1.0.3"
+VERSION = "v1.0.4"
 DEBUG = False
 
+
+IMPERSONATE_OPTIONS = [
+    "chrome120", "chrome124",
+    "edge99", "edge101",
+]
 # XInput / Controller Support
 
 class XINPUT_GAMEPAD(ctypes.Structure):
@@ -134,7 +140,7 @@ def setup_ps_controller() -> None | DualSenseController:
 def _ps_monitor_thread():
     global ps_controller
     while True:
-        time.sleep(3)
+        time.sleep(1)
         if (config.get("is_controller") and config.get("controller_type") == "dualsense" and ps_controller is None):
             result = setup_ps_controller()
             if result:
@@ -559,12 +565,13 @@ def should_fetch_stats(cache_entry: dict, now: float) -> bool:
 
 def request_player_stats_once(slug: str, target_user: str) -> dict:
     url = f"https://api.tracker.gg/api/v2/rocket-league/standard/profile/{slug}/{target_user}"
-    req = urllib.request.Request(url, headers={
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "application/json",
-    })
-    with urllib.request.urlopen(req, timeout=8) as response:
-        data = json.loads(response.read().decode("utf-8"))
+    response = cf_requests.get(
+        url,
+        impersonate=random.choice(IMPERSONATE_OPTIONS),
+        timeout=8,
+    )
+    response.raise_for_status()
+    data = response.json()
     if not isinstance(data.get("data"), dict):
         raise ValueError("Tracker API returned no profile data")
     return data
@@ -593,6 +600,10 @@ def fetch_player_stats(primary_id: str, display_name: str):
     platform = parts[0].lower()
     user_id = parts[1]
 
+    if platform == "switch":
+        if DEBUG: print(f"[DEBUG] Skipping Switch player: {display_name}")
+        return  
+    
     plat_map = {"steam": "steam", "epic": "epic", "xboxone": "xbl", "ps4": "psn", "switch": "switch"}
     slug = plat_map.get(platform, "epic")
 
