@@ -13,6 +13,9 @@ import ctypes
 import argparse
 import webbrowser
 import re
+import warnings
+import logging
+import atexit
 from ctypes import wintypes
 from dualsense_controller import DualSenseController
 
@@ -23,7 +26,11 @@ from PySide6.QtGui import QPainter, QColor, QFont, QPen, QPixmap
 
 signal.signal(signal.SIGINT, signal.SIG_DFL)
 
-VERSION = "v1.0.1"
+warnings.filterwarnings("ignore", message="Microphone state initially", category=UserWarning)
+logging.getLogger("dualsense_controller").setLevel(logging.CRITICAL)
+
+VERSION = "v1.0.2"
+DEBUG = False
 
 # XInput / Controller Support
 
@@ -105,6 +112,7 @@ def is_ps_connected() -> bool:
 
 def setup_ps_controller() -> None | DualSenseController:
     if not is_ps_connected():
+        if DEBUG: print("[DEBUG] setup_ps_controller: No DualSense detected")
         return None # no dualsense available
 
     controller = DualSenseController()
@@ -124,6 +132,15 @@ def setup_ps_controller() -> None | DualSenseController:
 def ps_get_inputs():
     """Returns list of currently held buttons"""
     return list(_ps_pressed)
+
+def _cleanup():
+    if ps_controller:
+        try:
+            ps_controller.deactivate()
+        except Exception:
+            pass
+
+atexit.register(_cleanup)
 
 def resource_path(relative_path):
     """ Get absolute path to resource, works for dev and for PyInstaller """
@@ -242,6 +259,8 @@ def load_or_setup_config(force_rebind=False):
                 config.update(json.load(f))
             config.setdefault("controller_type", "xinput")  # backward compat
             config.setdefault("joy_id", 0)
+            if config.get("controller_type") == "dualsense":
+                setup_ps_controller()
         except Exception as e:
             print(f"[Overlay] Failed to load config: {e}")
             needs_setup = True
@@ -305,7 +324,7 @@ def check_for_updates():
                 dialog = UpdateDialog(latest_version, final_url)
                 dialog.exec()
     except Exception as e:
-        print(f"[Update Check] Failed to check for updates: {e}")
+        if DEBUG: print(f"[DEBUG] Update check failed: {e}")
 
 FONT_NAME = "Segoe UI"
 FONT_SIZE = 11
@@ -514,7 +533,7 @@ def fetch_player_stats(primary_id: str, display_name: str):
     last_error = ""
 
     while True:
-        for _ in range(TRACKER_ATTEMPTS_PER_ROUND):
+        for attempt in range(TRACKER_ATTEMPTS_PER_ROUND):
             try:
                 data = request_player_stats_once(slug, target_user)
                 stats = parse_tracker_stats(data)
@@ -530,6 +549,9 @@ def fetch_player_stats(primary_id: str, display_name: str):
                 return
             except Exception as exc:
                 last_error = str(exc)
+                if DEBUG: print(f"[DEBUG] Tracker API error for {display_name} ({slug}/{target_user}) attempt {attempt + 1}/{TRACKER_ATTEMPTS_PER_ROUND}: {exc}")
+
+        if DEBUG: print(f"[DEBUG] All attempts failed for {display_name}, waiting {TRACKER_RETRY_WAIT}s before retry. Last error: {last_error}")
 
         old_stats = tracker_cache.get(primary_id, {}).get("stats", {})
         tracker_cache[primary_id] = {
@@ -544,6 +566,7 @@ def fetch_player_stats(primary_id: str, display_name: str):
         waited = 0.0
         while waited < TRACKER_RETRY_WAIT:
             if not player_is_in_current_match(primary_id):
+                if DEBUG: print(f"[DEBUG] {display_name} left match, aborting retry")
                 tracker_cache[primary_id] = {
                     "timestamp": time.time(),
                     "fetching": False,
@@ -600,7 +623,8 @@ def is_hotkey_pressed() -> bool:
                 return False
         else:
             return keyboard.is_pressed(config["hotkey"])
-    except Exception:
+    except Exception as e:
+        if DEBUG: print(f"[DEBUG] is_hotkey_pressed exception: {e}")
         return False
 
 def handle(msg: dict):
@@ -608,7 +632,9 @@ def handle(msg: dict):
     data = msg.get("Data", {})
     if isinstance(data, str):
         try: data = json.loads(data)
-        except Exception: return
+        except Exception as e:
+            if DEBUG: print(f"[DEBUG] Failed to parse event data for '{evt}': {e}")
+            return
 
     with state["lock"]:
         if evt == "UpdateState":
@@ -683,10 +709,12 @@ def read_stream():
                 objects, buf = extract_json_objects(buf)
                 for raw in objects:
                     try: handle(json.loads(raw))
-                    except Exception: pass
+                    except Exception as e:
+                        if DEBUG: print(f"[DEBUG] Failed to handle socket message: {e}")
                 if len(buf) > 1_000_000: buf = b""
             s.close()
-        except Exception: pass
+        except Exception as e:
+            if DEBUG: print(f"[DEBUG] Socket connection error: {e}")
         with state["lock"]:
             state["in_match"] = False
             state["players"] = []
@@ -943,12 +971,12 @@ class Overlay(QWidget):
 
             if not pid:
                 pass
-            elif cache_entry.get("error") and not stats:
-                painter.setPen(QColor(209, 213, 219))
-                painter.drawText(col_ranked, text_y, "API Error")
             elif cache_entry.get("fetching") and not stats:
                 painter.setPen(QColor(209, 213, 219))
                 painter.drawText(col_ranked, text_y, "Loading...")
+            elif cache_entry.get("error") and not stats:
+                painter.setPen(QColor(209, 213, 219))
+                painter.drawText(col_ranked, text_y, "API Error")
             elif stats:
                 painter.setPen(QColor(209, 213, 219))
                 
@@ -1037,7 +1065,12 @@ class Overlay(QWidget):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("-r", "--rebind", action="store_true", help="Force the hotkey rebind window to appear.")
+    parser.add_argument("-d", "--debug", action="store_true", help="Enable verbose debug logging.")
     args, unknown = parser.parse_known_args()
+
+    if args.debug:
+        DEBUG = True
+        print("[Debug] Debug mode enabled.")
 
     app = QApplication(sys.argv)
     

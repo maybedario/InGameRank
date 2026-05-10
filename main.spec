@@ -5,7 +5,7 @@ block_cipher = None
 a = Analysis(
     ['main.py'],
     pathex=[],
-    binaries=[],
+    binaries=[('hidapi.dll', '.')],
     datas=[('Playlists', 'Playlists'), ('Tiers', 'Tiers'), ('Divisions', 'Divisions')],
     hiddenimports=[],
     hookspath=[],
