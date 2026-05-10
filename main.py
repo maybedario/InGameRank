@@ -3,11 +3,38 @@ import os
 import warnings
 warnings.filterwarnings("ignore", message="Microphone state initially", category=UserWarning)
 import logging
+
 # suppress dualsense OSError 
 _ds_logger = logging.getLogger("dualsense_controller")
 _ds_logger.setLevel(logging.CRITICAL)
 _ds_logger.addHandler(logging.NullHandler())
 _ds_logger.propagate = False  
+
+class _StreamFilter:
+    def __init__(self, stream):
+        self.stream = stream
+        self._drop_next_newline = False
+
+    def write(self, data):
+        if isinstance(data, str):
+            if "An Exception in the loop thread occured" in data or "Failed to read from HID device" in data:
+                if not data.endswith('\n'):
+                    self._drop_next_newline = True
+                return len(data)
+            if self._drop_next_newline and data == '\n':
+                self._drop_next_newline = False
+                return len(data)
+            self._drop_next_newline = False
+        return self.stream.write(data)
+
+    def flush(self):
+        self.stream.flush()
+
+    def __getattr__(self, attr):
+        return getattr(self.stream, attr)
+
+sys.stderr = _StreamFilter(sys.stderr)
+sys.stdout = _StreamFilter(sys.stdout)
 
 import threading
 import time
@@ -32,7 +59,24 @@ from PySide6.QtGui import QPainter, QColor, QFont, QPen, QPixmap
 from curl_cffi import requests as cf_requests
 import random
 
-VERSION = "v1.0.4"
+class _DualSenseLogFilter(logging.Filter):
+    def filter(self, record):
+        msg = str(record.msg)
+        if "An Exception in the loop thread occured" in msg or "Failed to read from HID device" in msg:
+            return False
+        if record.exc_info:
+            exc_val = str(record.exc_info[1])
+            if "Failed to read from HID device" in exc_val:
+                return False
+        return True
+
+_ds_log_filter = _DualSenseLogFilter()
+for _logger in [logging.getLogger()] + list(logging.Logger.manager.loggerDict.values()):
+    if isinstance(_logger, logging.Logger):
+        for _h in _logger.handlers:
+            _h.addFilter(_ds_log_filter)
+
+VERSION = "v1.0.5"
 DEBUG = False
 
 
