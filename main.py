@@ -233,6 +233,37 @@ class BindWorker(QThread):
             
         keyboard.unhook_all()
 
+class FirstRunIniDialog(QDialog):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Action Required")
+        self.setFixedSize(480, 240)
+        self.setWindowFlags(Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
+        
+        layout = QVBoxLayout()
+        label = QLabel(
+            "<b>First Time Setup: Enable Rocket League API</b><br><br>"
+            "Please open and edit the following file:<br>"
+            "<b>&lt;Install Dir&gt;\\TAGame\\Config\\DefaultStatsAPI.ini</b><br><br>"
+            "Change the field <b>PacketSendRate</b> from <b>0</b> to <b>120</b><br>"
+            "<span style='font-size: 11px;'>(20 is recommended)</span><br><br>"
+            "<i>Please restart Rocket League if the game is already open.</i>"
+        )
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        label.setStyleSheet("font-size: 14px; font-family: Segoe UI;")
+        layout.addWidget(label)
+        
+        btn_layout = QHBoxLayout()
+        btn_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        btn_ok = QPushButton("Got it!")
+        btn_ok.setFixedSize(100, 30)
+        btn_ok.clicked.connect(self.accept)
+        
+        btn_layout.addWidget(btn_ok)
+        layout.addLayout(btn_layout)
+        self.setLayout(layout)
+
 class SetupDialog(QDialog):
     def __init__(self):
         super().__init__()
@@ -276,6 +307,8 @@ class SetupDialog(QDialog):
 def load_or_setup_config(force_rebind=False):
     global config
     needs_setup = force_rebind
+    is_first_run = False
+
     if os.path.exists(CONFIG_FILE) and not force_rebind:
         try:
             with open(CONFIG_FILE, "r") as f:
@@ -287,8 +320,15 @@ def load_or_setup_config(force_rebind=False):
         except Exception as e:
             print(f"[Overlay] Failed to load config: {e}")
             needs_setup = True
+            is_first_run = True
     else:
         needs_setup = True
+        if not force_rebind:
+            is_first_run = True
+
+    if is_first_run:
+        ini_dialog = FirstRunIniDialog()
+        ini_dialog.exec()
 
     if needs_setup:
         dialog = SetupDialog()
