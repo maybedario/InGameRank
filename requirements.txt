@@ -1,3 +1,4 @@
 PySide6
 keyboard
-pywin32   
+pywin32
+dualsense-controller
